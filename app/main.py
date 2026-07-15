@@ -23,8 +23,8 @@ import string
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-import dictionary
-from game import MAX_PLAYERS, Room, handle_pass, handle_submit, handle_swap, turn_timer
+from . import dictionary
+from .game import MAX_PLAYERS, Room, handle_pass, handle_submit, handle_swap, turn_timer
 
 app = FastAPI(title="Stock Scrabble Backend")
 

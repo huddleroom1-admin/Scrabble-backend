@@ -29,9 +29,9 @@ import asyncio
 import random
 import time
 
-import dictionary
-import rules
-from stocks import all_letter_tiles
+from . import dictionary
+from . import rules
+from .stocks import all_letter_tiles
 
 MAX_PLAYERS = 2
 RACK_SIZE = 7

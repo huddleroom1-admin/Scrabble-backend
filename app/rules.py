@@ -8,7 +8,7 @@ Tile info is a dict with at least: {"letter": "A", "points": 4}. Board
 premiums come from board.PREMIUM; premiums only apply to NEWLY placed tiles.
 """
 
-import board
+from . import board
 
 # Premium multipliers per square: (letter_mult, word_mult).
 LETTER_MULT = {board.DL: 2, board.TL: 3}
