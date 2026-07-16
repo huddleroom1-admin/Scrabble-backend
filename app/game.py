@@ -45,6 +45,7 @@ def tile_to_dict(tile):
         "points": tile.points,
         "ticker": tile.ticker,
         "name": tile.name,
+        "display": getattr(tile, "display", tile.name)
     }
 
 
