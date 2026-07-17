@@ -29,6 +29,7 @@ import asyncio
 import random
 import time
 
+from . import ai
 from . import dictionary
 from . import rules
 from .stocks import all_letter_tiles
@@ -36,6 +37,8 @@ from .stocks import all_letter_tiles
 MAX_PLAYERS = 2
 RACK_SIZE = 7
 TURN_SECONDS = 180  # per-turn time limit (3 min); expiry auto-passes
+AI_THINK_MIN = 1.0  # seconds -- artificial delay so the AI's move doesn't
+AI_THINK_MAX = 2.5  # feel instant/jarring
 
 
 def tile_to_dict(tile):
@@ -45,7 +48,7 @@ def tile_to_dict(tile):
         "points": tile.points,
         "ticker": tile.ticker,
         "name": tile.name,
-        "display": getattr(tile, "display", tile.name)
+        "display": getattr(tile, "display", tile.name),
     }
 
 
@@ -90,10 +93,19 @@ class Room:
 
         self.timer_task = None  # asyncio.Task, started once the room is full
 
+        # Single-player support: when set (always 2, by convention), this
+        # player number is driven by the AI instead of a WebSocket client.
+        self.ai_player = None
+        self.ai_pending = False  # guards against scheduling two AI turns at once
+
     # ---- bookkeeping (mirrors the original GameState) ---------------------
 
     def add_history(self, entry):
         self.history.append(entry)
+
+    def connected_count(self):
+        """Real WebSocket clients, plus 1 if an AI occupies the other slot."""
+        return len(self.clients) + (1 if self.ai_player else 0)
 
     def start_turn_clock(self):
         if self.game_over:
@@ -111,6 +123,14 @@ class Room:
     def next_turn(self):
         self.turn = 2 if self.turn == 1 else 1
         self.start_turn_clock()
+        if (
+            self.ai_player
+            and self.turn == self.ai_player
+            and not self.game_over
+            and not self.ai_pending
+        ):
+            self.ai_pending = True
+            asyncio.create_task(run_ai_turn(self))
 
     def rack_points(self, player):
         return sum(t.points for t in self.racks.get(player, []))
@@ -139,7 +159,7 @@ class Room:
             "type": "STATE",
             "placed": self.placed,
             "turn": self.turn,
-            "players": len(self.clients),
+            "players": self.connected_count(),
             "scores": self.scores,
             "bag": len(self.bag),
             "your_rack": [tile_to_dict(t) for t in self.racks.get(player, [])],
@@ -166,7 +186,7 @@ class Room:
             self.clients.pop(p, None)
 
     async def pause(self, player):
-        if self.paused or self.game_over or len(self.clients) < MAX_PLAYERS:
+        if self.paused or self.game_over or self.connected_count() < MAX_PLAYERS:
             return
         self.paused_remaining = self.seconds_left()
         self.paused = True
@@ -219,7 +239,7 @@ class Room:
         }
 
     async def surrender(self, player):
-        if self.game_over or len(self.clients) < MAX_PLAYERS:
+        if self.game_over or self.connected_count() < MAX_PLAYERS:
             return
         opponent = 2 if player == 1 else 1
         self.game_over = True
@@ -258,9 +278,10 @@ class Room:
         self.bag = all_letter_tiles()
         random.shuffle(self.bag)
         self.racks = {1: [], 2: []}
-        for p in list(self.clients):
-            self.deal_rack(p)
-        if len(self.clients) == MAX_PLAYERS:
+        for p in (1, 2):
+            if p in self.clients or p == self.ai_player:
+                self.deal_rack(p)
+        if self.connected_count() == MAX_PLAYERS:
             self.start_turn_clock()
         else:
             self.turn_deadline = None
@@ -280,7 +301,7 @@ async def handle_submit(room: Room, player, moves):
             return "Game over.", None
         if room.paused:
             return "Game is paused.", None
-        if len(room.clients) < MAX_PLAYERS:
+        if room.connected_count() < MAX_PLAYERS:
             return "Waiting for opponent.", None
         if player != room.turn:
             return "Not your turn.", None
@@ -365,7 +386,7 @@ async def handle_swap(room: Room, player, indices):
             return "Game over.", None
         if room.paused:
             return "Game is paused.", None
-        if len(room.clients) < MAX_PLAYERS:
+        if room.connected_count() < MAX_PLAYERS:
             return "Waiting for opponent.", None
         if player != room.turn:
             return "Not your turn.", None
@@ -416,9 +437,39 @@ async def handle_pass(room: Room, player):
             not room.game_over
             and not room.paused
             and player == room.turn
-            and len(room.clients) == MAX_PLAYERS
+            and room.connected_count() == MAX_PLAYERS
         ):
             await _pass_locked(room, player)
+
+
+async def run_ai_turn(room: "Room"):
+    """Compute and submit the AI's move for its turn. Scheduled by
+    Room.next_turn() whenever the turn passes to room.ai_player.
+    """
+    try:
+        await asyncio.sleep(AI_THINK_MIN + random.random() * (AI_THINK_MAX - AI_THINK_MIN))
+        async with room.lock:
+            if room.game_over or room.paused or room.turn != room.ai_player:
+                return
+            existing = room.existing_for_rules()
+            rack_snapshot = list(room.racks[room.ai_player])
+            dict_wrapper = room.dict
+            allow_short = len(room.bag) == 0
+            bag_size = len(room.bag)
+
+        loop = asyncio.get_event_loop()
+        decision = await loop.run_in_executor(
+            None, ai.choose_move, existing, rack_snapshot, dict_wrapper, allow_short, bag_size
+        )
+    finally:
+        room.ai_pending = False
+
+    if decision["action"] == "submit":
+        await handle_submit(room, room.ai_player, decision["moves"])
+    elif decision["action"] == "swap":
+        await handle_swap(room, room.ai_player, decision["indices"])
+    else:
+        await handle_pass(room, room.ai_player)
 
 
 async def turn_timer(room: Room):
@@ -430,7 +481,7 @@ async def turn_timer(room: Room):
         async with room.lock:
             if (
                 room.game_over
-                or len(room.clients) < MAX_PLAYERS
+                or room.connected_count() < MAX_PLAYERS
                 or room.turn_deadline is None
             ):
                 continue

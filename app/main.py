@@ -9,14 +9,21 @@ Run locally:
     pip install -r requirements.txt
     uvicorn app.main:app --reload --port 8000
 
-Client flow:
+Client flow (two humans):
     1. POST /rooms          -> {"code": "AB3F9K"}   (or just pick your own
                                 code and share it -- any string works)
     2. Connect a WebSocket to /ws/{code}
     3. First message received is {"type": "WELCOME", "player": 1 or 2}
     4. From then on, send/receive JSON messages per game.py's docstring.
+
+Client flow (single player vs AI):
+    1. POST /rooms?vs_ai=true -> {"code": "AB3F9K", "vs_ai": true}
+    2. Connect a WebSocket to /ws/{code} -- you'll always be player 1.
+       The game starts immediately (no waiting for a second connection);
+       the AI plays player 2 automatically on its turns.
 """
 
+import asyncio
 import random
 import string
 
@@ -50,13 +57,21 @@ async def health():
 
 
 @app.post("/rooms")
-async def create_room():
-    """Generate a fresh, unused room code."""
+async def create_room(vs_ai: bool = False):
+    """Generate a fresh, unused room code. Pass ?vs_ai=true to create a
+    single-player room where the second slot is played by the AI --
+    the game starts as soon as one human connects, no waiting required.
+    """
     while True:
         code = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
         if code not in rooms:
             break
-    return {"code": code}
+    room = Room(code)
+    if vs_ai:
+        room.ai_player = 2
+        room.deal_rack(2)
+    rooms[code] = room
+    return {"code": code, "vs_ai": vs_ai}
 
 
 @app.websocket("/ws/{code}")
@@ -65,7 +80,7 @@ async def game_socket(websocket: WebSocket, code: str):
     room = rooms.setdefault(code, Room(code))
 
     async with room.lock:
-        if len(room.clients) >= MAX_PLAYERS:
+        if room.connected_count() >= MAX_PLAYERS:
             await websocket.accept()
             await websocket.send_json({"type": "ERROR", "msg": "Game is full."})
             await websocket.close()
@@ -75,11 +90,9 @@ async def game_socket(websocket: WebSocket, code: str):
         room.clients[player] = websocket
         room.deal_rack(player)
         await websocket.send_json({"type": "WELCOME", "player": player})
-        if len(room.clients) == MAX_PLAYERS:
+        if room.connected_count() == MAX_PLAYERS:
             room.start_turn_clock()
             if room.timer_task is None:
-                import asyncio
-
                 room.timer_task = asyncio.create_task(turn_timer(room))
         await room.broadcast()
 
